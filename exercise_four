@@ -1,0 +1,146 @@
+#include <stdio.h>
+#include <iostream>
+#include <stdlib.h>
+#include <random>
+using namespace std;
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+
+#define SECTION_SIZE 2048
+
+//使用Brent-Kung实现
+__global__ void  kernel1(float* A, float* S, int N) {
+    //设置共享内存
+    __shared__ float XY[SECTION_SIZE];
+
+    //将数组传到共享内存
+    int i = 2 * blockIdx.x * blockDim.x + threadIdx.x;//尺寸大小
+    if (i < N) 
+        XY[threadIdx.x] = A[i];
+    else
+        XY[threadIdx.x] = 0.0f;
+    if (i + blockDim.x < N) 
+        XY[threadIdx.x + blockDim.x] = A[i + blockDim.x];
+    else 
+        XY[threadIdx.x + blockDim.x] = 0.0f;
+
+    //归约求和 
+    for (unsigned int stride = 1; stride <= blockDim.x; stride *= 2) {
+        __syncthreads();
+        int index = (threadIdx.x + 1) * stride * 2 - 1;
+        if (index < SECTION_SIZE)
+            XY[index] += XY[index - stride];
+    }
+
+    //分发部分和
+    for (unsigned int stride = SECTION_SIZE / 4; stride > 0; stride /= 2) {
+        __syncthreads();
+        int index = (threadIdx.x + 1) * stride * 2 - 1;
+        if (index + stride < SECTION_SIZE)
+            XY[index + stride] += XY[index];
+    }
+    __syncthreads();
+
+    //处理后写回原组
+    if (i < N)
+        A[i] = XY[threadIdx.x];
+    if (i + blockDim.x < N) 
+        A[i + blockDim.x] = XY[threadIdx.x + blockDim.x];
+    __syncthreads();
+
+
+    //将扫描块中最后一个XY元素输出值写入S的blockIdx.x位置
+    if (threadIdx.x == 0) {
+        S[blockIdx.x] = XY[SECTION_SIZE - 1];
+    }
+}
+
+//同样使用Brent-Kung实现，只是比起kernel1没有最后一个线程
+__global__ void  kernel2(float* A, int N) {
+    //设置共享内存
+    __shared__ float XY[SECTION_SIZE];
+
+    //将数组传到共享内存
+    int i = 2 * blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) 
+        XY[threadIdx.x] = A[i];
+    if (i + blockDim.x < N) 
+        XY[threadIdx.x + blockDim.x] = A[i + blockDim.x];
+
+    //归约求和 
+    for (unsigned int stride = 1; stride <= blockDim.x; stride *= 2) {
+        __syncthreads();
+        int index = (threadIdx.x + 1) * stride * 2 - 1;
+        if (index < SECTION_SIZE)
+            XY[index] += XY[index - stride];
+    }
+
+    //分发部分和
+    for (unsigned int stride = SECTION_SIZE / 4; stride > 0; stride /= 2) {
+        __syncthreads();
+        int index = (threadIdx.x + 1) * stride * 2 - 1;
+        if (index + stride < SECTION_SIZE)
+            XY[index + stride] += XY[index];
+    }
+
+    //处理后写回原组
+    __syncthreads();
+    if (i < N) 
+        A[i] = XY[threadIdx.x];
+    if (i + blockDim.x < N) 
+        A[i + blockDim.x] = XY[threadIdx.x + blockDim.x];
+}
+
+//将前面得到的和，加到原扫描块中的元素上
+__global__ void kernel3(float* A, float* S, int N) {
+    //一个线程处理两个元素
+    int i = 2 * blockDim.x * blockIdx.x + threadIdx.x;
+    if (blockIdx.x > 0) {
+        A[i] += S[blockIdx.x - 1];
+        A[blockDim.x + i] += S[blockIdx.x - 1];
+    }
+}
+
+//调用kernel，实现函数
+void prefix_sum(float* A, int N) {
+    float* dev_A, * S;
+    int size = N * sizeof(float);
+    cudaMalloc(&dev_A, size);
+    cudaMalloc(&S, ceil((float)N / SECTION_SIZE) * sizeof(float));
+    cudaMemcpy(dev_A, A, size, cudaMemcpyHostToDevice);
+    kernel1 <<<ceil((float)N / (SECTION_SIZE)), SECTION_SIZE / 2 >>> (dev_A, S, N);
+    kernel2 <<<ceil((float)(ceil((float)N / SECTION_SIZE)) / (SECTION_SIZE)), SECTION_SIZE / 2 >>> (S, N);
+    kernel3 <<<ceil((float)N / (SECTION_SIZE)), SECTION_SIZE / 2 >>> (dev_A, S, N);
+    cudaMemcpy(A, dev_A, size, cudaMemcpyDeviceToHost);
+    cudaFree(dev_A);
+}
+
+int main() {
+    int n;
+    cout << "输入数组的长度:";
+    cin >> n;
+    float* A = (float*)malloc(n * sizeof(float));
+    for (int i = 0; i < n; ++i) {
+        A[i] = float(rand() % 6);//原始数组随机初始化
+    }
+
+    cout << "原始数组：";
+    for (int i = 0; i < n; ++i) {
+        cout << A[i] << " ";//打印原始数组
+    }
+
+    cout << endl;
+
+    prefix_sum(A, n);//调用并行扫描前缀和函数
+
+    cout << "处理后数组:";
+    for (int i = 0; i < n; ++i) {
+        cout << A[i] << " ";//打印处理后数组
+    }
+
+    free(A);
+    return 0;
+}
+
